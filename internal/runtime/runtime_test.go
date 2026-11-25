@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/xexgm/GMAgent/internal/model"
+	"github.com/xexgm/GMAgent/internal/tool"
 )
 
 type modelFunc func(context.Context, []model.Message, []model.ToolDefinition) (model.Message, error)
@@ -50,8 +52,8 @@ func TestRunReturnsToolResultsWithMatchingIDs(t *testing.T) {
 	calls := 0
 	client := modelFunc(func(_ context.Context, messages []model.Message, tools []model.ToolDefinition) (model.Message, error) {
 		calls++
-		if len(tools) != 1 || tools[0].Function.Name != "read_file" {
-			t.Fatal("read_file definition must be sent on every request")
+		if len(tools) != 2 || tools[0].Function.Name != "read_file" || tools[1].Function.Name != "list_files" {
+			t.Fatal("both tool definitions must be sent on every request")
 		}
 		if calls == 1 {
 			return model.Message{
@@ -80,6 +82,71 @@ func TestRunReturnsToolResultsWithMatchingIDs(t *testing.T) {
 	}
 	if !strings.Contains(trace.String(), "成功读取 0 字节") {
 		t.Fatal("empty file should be reported as a successful read")
+	}
+}
+
+func TestRunListsFilesBeforeReading(t *testing.T) {
+	calls := 0
+	client := modelFunc(func(_ context.Context, messages []model.Message, tools []model.ToolDefinition) (model.Message, error) {
+		calls++
+		if len(tools) != 2 || tools[0].Function.Name != "read_file" || tools[1].Function.Name != "list_files" {
+			t.Fatal("both tool definitions must be sent on every request")
+		}
+		switch calls {
+		case 1:
+			return model.Message{
+				Role: "assistant",
+				ToolCalls: []model.ToolCall{{
+					ID:   "discover",
+					Type: "function",
+					Function: model.FunctionCall{
+						Name:      "list_files",
+						Arguments: `{}`,
+					},
+				}},
+			}, nil
+		case 2:
+			if len(messages) != 4 || messages[2].ToolCalls[0].ID != "discover" {
+				t.Fatal("list call was not preserved in message history")
+			}
+			last := messages[len(messages)-1]
+			if last.Role != "tool" || last.ToolCallID != "discover" {
+				t.Fatal("list result does not match its tool call")
+			}
+			var result tool.ListFilesResult
+			if err := json.Unmarshal([]byte(last.Content), &result); err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Files) != 2 || result.Truncated {
+				t.Fatalf("unexpected file listing: %+v", result)
+			}
+			for _, path := range result.Files {
+				if strings.HasSuffix(path, ".md") {
+					return model.Message{Role: "assistant", ToolCalls: []model.ToolCall{readCall("read-discovered", path)}}, nil
+				}
+			}
+			t.Fatal("list_files did not discover the project documentation")
+		case 3:
+			if len(messages) != 6 {
+				t.Fatalf("got %d messages, want history of list and read calls", len(messages))
+			}
+			last := messages[len(messages)-1]
+			if last.Role != "tool" || last.ToolCallID != "read-discovered" || last.Content != "项目说明" {
+				t.Fatal("discovered file content was not returned to the model")
+			}
+			return model.Message{Role: "assistant", Content: "已找到并读取项目说明"}, nil
+		default:
+			t.Fatal("unexpected extra model call")
+		}
+		return model.Message{}, nil
+	})
+	var trace bytes.Buffer
+	got, err := Run(context.Background(), client, "找到并阅读项目说明", testRepo(t), &trace)
+	if err != nil || got != "已找到并读取项目说明" || calls != 3 {
+		t.Fatalf("Run = %q, %v, calls %d", got, err, calls)
+	}
+	if !strings.Contains(trace.String(), `"files"`) || !strings.Contains(trace.String(), "成功读取") {
+		t.Fatal("trace should show both file discovery and reading")
 	}
 }
 
@@ -152,10 +219,39 @@ func TestExecuteToolRejectsInvalidCalls(t *testing.T) {
 		{Type: "function", Function: model.FunctionCall{Name: "read_file", Arguments: `{"path":"readme.md","extra":true}`}},
 		{Type: "function", Function: model.FunctionCall{Name: "read_file", Arguments: `{"path":"readme.md"} {}`}},
 		{Type: "function", Function: model.FunctionCall{Name: "read_file", Arguments: `null`}},
+		{Type: "function", Function: model.FunctionCall{Name: "read_file", Arguments: `{}`}},
+		{Type: "function", Function: model.FunctionCall{Name: "read_file", Arguments: `{"path":null}`}},
+		{Type: "function", Function: model.FunctionCall{Name: "list_files", Arguments: `{`}},
+		{Type: "function", Function: model.FunctionCall{Name: "list_files", Arguments: `null`}},
+		{Type: "function", Function: model.FunctionCall{Name: "list_files", Arguments: `[]`}},
+		{Type: "function", Function: model.FunctionCall{Name: "list_files", Arguments: `"."`}},
+		{Type: "function", Function: model.FunctionCall{Name: "list_files", Arguments: `{"path":null}`}},
+		{Type: "function", Function: model.FunctionCall{Name: "list_files", Arguments: `{"path":1}`}},
+		{Type: "function", Function: model.FunctionCall{Name: "list_files", Arguments: `{"path":".","extra":true}`}},
+		{Type: "function", Function: model.FunctionCall{Name: "list_files", Arguments: `{} {}`}},
+		{Type: "function", Function: model.FunctionCall{Name: "list_files", Arguments: `{} trailing`}},
 	}
 	for _, call := range cases {
-		if _, err := executeTool(root, call); err == nil {
+		if _, err := executeTool(context.Background(), root, call); err == nil {
 			t.Fatalf("unexpected success for invalid tool request: %+v", call)
+		}
+	}
+}
+
+func TestExecuteListFilesDefaultsToRoot(t *testing.T) {
+	root, err := os.OpenRoot(testRepo(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	for _, arguments := range []string{`{}`, `{"path":""}`, `{"path":"."}`} {
+		call := model.ToolCall{Type: "function", Function: model.FunctionCall{Name: "list_files", Arguments: arguments}}
+		got, err := executeTool(context.Background(), root, call)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != `{"files":["empty.txt","readme.md"],"truncated":false}` {
+			t.Fatalf("executeTool with %s = %s, want both repository files", arguments, got)
 		}
 	}
 }
