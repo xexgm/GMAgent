@@ -21,11 +21,6 @@ type Client struct {
 	httpClient *http.Client
 }
 
-type message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
 func NewClient(apiKey, modelID string) (*Client, error) {
 	apiKey = strings.TrimSpace(apiKey)
 	modelID = strings.TrimSpace(modelID)
@@ -43,60 +38,65 @@ func NewClient(apiKey, modelID string) (*Client, error) {
 	}, nil
 }
 
-// Chat 发送一条用户消息，等待模型生成完整回复。
-func (c *Client) Chat(ctx context.Context, task string) (string, error) {
-	payload, err := json.Marshal(map[string]any{
-		"model":    c.modelID,
-		"messages": []message{{Role: "user", Content: task}},
-		"stream":   false,
+// Chat 发送历史消息和工具定义，返回文本回复或工具调用请求。
+func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolDefinition) (Message, error) {
+	payload, err := json.Marshal(chatRequest{
+		Model:    c.modelID,
+		Messages: messages,
+		Tools:    tools,
 		// 第一次接入先关闭深度思考，直接获取文本回复。
-		"thinking": map[string]string{"type": "disabled"},
+		Thinking: thinking{Type: "disabled"},
 	})
 	if err != nil {
-		return "", fmt.Errorf("编码模型请求：%w", err)
+		return Message{}, fmt.Errorf("编码模型请求：%w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, chatEndpoint, bytes.NewReader(payload))
 	if err != nil {
-		return "", fmt.Errorf("创建模型请求：%w", err)
+		return Message{}, fmt.Errorf("创建模型请求：%w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("请求模型 API：%w", err)
+		return Message{}, fmt.Errorf("请求模型 API：%w", err)
 	}
 	defer resp.Body.Close()
 
-	// 本次只接收文本回复，限制读取大小，避免异常响应占用过多内存。
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// 限制响应大小，读取额外一个字节用于检测是否超限。
+	const maxResponseBytes = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return "", fmt.Errorf("读取模型响应：%w", err)
+		return Message{}, fmt.Errorf("读取模型响应：%w", err)
+	}
+	if len(body) > maxResponseBytes {
+		return Message{}, fmt.Errorf("模型响应超过 1 MB 限制")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("模型 API 返回 HTTP %d：%s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return Message{}, fmt.Errorf("模型 API 返回 HTTP %d：%s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	var result struct {
-		Choices []struct {
-			Message      message `json:"message"`
-			FinishReason string  `json:"finish_reason"`
-		} `json:"choices"`
-	}
+	var result chatResponse
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("解析模型响应：%w", err)
+		return Message{}, fmt.Errorf("解析模型响应：%w", err)
 	}
 	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("模型响应中没有 choices")
+		return Message{}, fmt.Errorf("模型响应中没有 choices")
 	}
 	if result.Choices[0].FinishReason == "length" {
-		return "", fmt.Errorf("模型回复达到输出长度限制，未完整生成，请缩小本次任务")
+		return Message{}, fmt.Errorf("模型回复达到输出长度限制，未完整生成，请缩小本次任务")
+	}
+	if result.Choices[0].FinishReason == "content_filter" {
+		return Message{}, fmt.Errorf("模型回复被内容过滤，未完整生成")
 	}
 
-	reply := result.Choices[0].Message.Content
-	if strings.TrimSpace(reply) == "" {
-		return "", fmt.Errorf("模型返回了空文本回复")
+	reply := result.Choices[0].Message
+	if reply.Role != "assistant" {
+		return Message{}, fmt.Errorf("模型返回了异常消息角色：%q", reply.Role)
+	}
+	if len(reply.ToolCalls) == 0 && strings.TrimSpace(reply.Content) == "" {
+		return Message{}, fmt.Errorf("模型没有返回文本或工具调用")
 	}
 	return reply, nil
 }
