@@ -1,6 +1,8 @@
 package tool
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,30 +46,41 @@ func TestReadFile(t *testing.T) {
 	defer root.Close()
 
 	tests := []struct {
-		name    string
-		path    string
-		want    string
-		wantErr bool
+		name          string
+		path          string
+		want          string
+		wantErr       error
+		wantPathError bool
 	}{
 		{name: "text", path: "readme.md", want: files["readme.md"]},
 		{name: "empty file", path: "empty.txt"},
 		{name: "exact size limit", path: "limit.txt", want: files["limit.txt"]},
 		{name: "internal symlink", path: "inside-link", want: files["readme.md"]},
-		{name: "missing file", path: "missing.txt", wantErr: true},
-		{name: "empty path", path: "", wantErr: true},
-		{name: "directory", path: ".", wantErr: true},
-		{name: "parent traversal", path: "../outside.txt", wantErr: true},
-		{name: "absolute path", path: outside, wantErr: true},
-		{name: "external symlink", path: "outside-link", wantErr: true},
-		{name: "too large", path: "large.txt", wantErr: true},
-		{name: "binary with NUL", path: "nul.bin", wantErr: true},
-		{name: "invalid UTF-8", path: "bad.bin", wantErr: true},
+		{name: "missing file", path: "missing.txt", wantErr: fs.ErrNotExist, wantPathError: true},
+		{name: "empty path", path: "", wantErr: ErrInvalidPath},
+		{name: "directory", path: ".", wantErr: ErrNotRegularFile},
+		{name: "parent traversal", path: "../outside.txt", wantErr: ErrInvalidPath},
+		{name: "absolute path", path: outside, wantErr: ErrInvalidPath},
+		{name: "external symlink", path: "outside-link", wantPathError: true},
+		{name: "too large", path: "large.txt", wantErr: ErrFileTooLarge},
+		{name: "binary with NUL", path: "nul.bin", wantErr: ErrNotTextFile},
+		{name: "invalid UTF-8", path: "bad.bin", wantErr: ErrNotTextFile},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := ReadFile(root, tt.path)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("ReadFile error = %v, wantErr %v", err, tt.wantErr)
+			wantFailure := tt.wantErr != nil || tt.wantPathError
+			if (err != nil) != wantFailure {
+				t.Fatalf("ReadFile error = %v, want failure %v", err, wantFailure)
+			}
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Fatalf("ReadFile error = %v, want category %v", err, tt.wantErr)
+			}
+			if tt.wantPathError {
+				var pathErr *os.PathError
+				if !errors.As(err, &pathErr) {
+					t.Fatalf("ReadFile error = %v, want preserved filesystem error", err)
+				}
 			}
 			if got != tt.want {
 				t.Fatalf("ReadFile returned unexpected content: length %d, want %d", len(got), len(tt.want))

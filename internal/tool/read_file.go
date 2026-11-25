@@ -11,11 +11,10 @@ import (
 
 const MaxReadBytes = 64 * 1024
 
-// ReadFile 读取仓库内的普通 UTF-8 文本文件。
-// root 由程序确定，模型只能提供相对于它的 path。
+// ReadFile 读取仓库内的普通 UTF-8 文本文件；root 由程序确定，模型只能提供相对于它的 path
 func ReadFile(root *os.Root, path string) (string, error) {
 	if !filepath.IsLocal(path) {
-		return "", fmt.Errorf("path 必须是仓库内的相对路径")
+		return "", ErrInvalidPath
 	}
 
 	// 先拒绝目录、设备等非普通文件。Root 同时防止符号链接越界。
@@ -24,10 +23,10 @@ func ReadFile(root *os.Root, path string) (string, error) {
 		return "", fmt.Errorf("检查文件：%w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("只允许读取普通文件")
+		return "", ErrNotRegularFile
 	}
 	if info.Size() > MaxReadBytes {
-		return "", fmt.Errorf("文件超过 64 KB 读取限制")
+		return "", ErrFileTooLarge
 	}
 
 	file, err := root.Open(path)
@@ -41,7 +40,7 @@ func ReadFile(root *os.Root, path string) (string, error) {
 		return "", fmt.Errorf("检查已打开文件：%w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("只允许读取普通文件")
+		return "", ErrNotRegularFile
 	}
 
 	data, err := io.ReadAll(io.LimitReader(file, MaxReadBytes+1))
@@ -49,10 +48,10 @@ func ReadFile(root *os.Root, path string) (string, error) {
 		return "", fmt.Errorf("读取文件：%w", err)
 	}
 	if len(data) > MaxReadBytes {
-		return "", fmt.Errorf("文件超过 64 KB 读取限制")
+		return "", ErrFileTooLarge
 	}
 	if !utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0 {
-		return "", fmt.Errorf("只支持 UTF-8 文本文件")
+		return "", ErrNotTextFile
 	}
 	return string(data), nil
 }
